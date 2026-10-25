@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photo-tidy"
+version = "0.1.0"
+description = "Fix photo orientation with a local vision model and write UTF-8 captions into EXIF. Everything stays on your machine."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["Pillow>=10", "piexif>=1.1"]
+
+[project.scripts]
+photo-tidy = "photo_tidy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

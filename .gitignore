@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+.DS_Store
+# photos never belong in the repo
+*.jpg
+*.jpeg
+*.png
+*.heic
+_originals/
