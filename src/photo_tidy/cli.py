@@ -20,20 +20,44 @@ def load_caption_map(path: Path) -> dict[str, str]:
 
 def cmd_orient(args) -> int:
     vision = OllamaVision(args.model, args.ollama_url)
+    if args.verbose:
+        print(f"Model: {args.model}; Ollama: {args.ollama_url}", flush=True)
     try:
         results = fix_folder(Path(args.path), vision.is_upright, dry_run=args.dry_run,
-                             bake_exif=not args.no_bake_exif, backup=args.backup)
+                             bake_exif=not args.no_bake_exif, backup=args.backup, rotation=args.rotate,
+                             pick_panel=vision.pick_panel)
     except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
         print(f"Cannot reach Ollama at {args.ollama_url} ({e}). Start it with: ollama serve", file=sys.stderr)
         return 2
+    except ValueError as e:
+        print(f"Cannot determine orientation: {e}", file=sys.stderr)
+        return 2
     for r in results:
+        if args.verbose:
+            if args.rotate is not None:
+                detail = f"explicit rotation {args.rotate}° clockwise; model not called"
+            elif r.upright is None:
+                detail = "camera EXIF trusted; model not called"
+            else:
+                votes = ", ".join(f"{d}°={'upright' if yes else 'wrong way up'}" for d, yes in r.upright.items())
+                good = sum(r.upright.values())
+                decision = ("original judged upright" if good == 1 and r.upright[0] else
+                            "ambiguous: multiple orientations judged upright" if good > 1 else
+                            "uncertain: no orientation judged upright" if good == 0 else
+                            f"rotate {r.degrees}° clockwise")
+                detail = f"{votes}; {decision}"
+                if r.panel_decision is not None:
+                    detail += f"; four-panel comparison selected {r.panel_decision}° clockwise"
+            print(f"{r.file}: EXIF {r.exif_tag}; {detail}")
         if r.changed:
-            what = f"rotate {r.degrees}° (model)" if r.reason == "model" else "apply camera EXIF orientation"
+            what = f"rotate {r.degrees}° ({r.reason})" if r.reason in ("model", "manual") else "apply camera EXIF orientation"
             print(f"{r.file}: {what}" + ("  [dry run]" if args.dry_run else ""))
     n_model = sum(r.reason == "model" for r in results)
     n_exif = sum(r.reason == "exif" for r in results)
-    print(f"{len(results)} photos checked: {n_model} rotated by the model, {n_exif} EXIF orientation baked in, "
-          f"{len(results) - n_model - n_exif} unchanged" + (" (dry run, nothing written)" if args.dry_run else ""))
+    n_manual = sum(r.reason == "manual" for r in results)
+    manual = f"{n_manual} rotated by explicit angle, " if args.rotate is not None else ""
+    print(f"{len(results)} photos checked: {n_model} rotated by the model, {manual}{n_exif} EXIF orientation baked in, "
+          f"{len(results) - n_model - n_exif - n_manual} unchanged" + (" (dry run, nothing written)" if args.dry_run else ""))
     return 0
 
 
@@ -65,11 +89,14 @@ def main(argv: list[str] | None = None) -> int:
     o = sub.add_parser("orient", help="fix photo orientation (EXIF first, local vision model otherwise)")
     o.add_argument("path", help="a photo or a folder (searched recursively)")
     o.add_argument("--dry-run", action="store_true", help="show decisions, change nothing")
+    o.add_argument("--verbose", action="store_true", help="show EXIF and the model's verdict for each rotation")
+    o.add_argument("--rotate", type=int, choices=(0, 90, 180, 270),
+                   help="apply this clockwise angle after EXIF, without asking Ollama; applies to every input photo")
     o.add_argument("--model", default="ministral-3", help="Ollama vision model (default: %(default)s)")
     o.add_argument("--ollama-url", default="http://localhost:11434")
     o.add_argument("--no-bake-exif", action="store_true", help="leave photos that only need their EXIF orientation alone")
     o.add_argument("--backup", choices=["model", "all", "none"], default="model",
-                   help="copy originals to _originals/ (default: only when the model chose the rotation)")
+                   help="copy originals to _originals/ (default: model-chosen and explicit rotations)")
     o.set_defaults(func=cmd_orient)
 
     c = sub.add_parser("caption", help="read or write UTF-8 captions in EXIF")

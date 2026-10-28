@@ -1,64 +1,98 @@
 # photo-tidy
 
-Two small chores for a photo archive, done **locally**: fix photos that are sideways or upside down, and keep
-captions inside the files (including `ä`, `ö`, `å` and other non-ASCII text).
+**Straighten photos with camera EXIF or a local vision model. Add captions to JPEG metadata.**
 
-- No cloud, no accounts. The only network call is to your own [Ollama](https://ollama.com) server on `localhost`.
-- Conservative by design: a photo is only rotated when the evidence is clear. Uncertain photos are left alone.
+```text
+SIDEWAYS PHOTO        CHECK ORIENTATION       UPRIGHT PHOTO
++-----------+         +-------------------+   +-----------+
+| \         |         | EXIF rotation?    |   |     O     |
+|  +---O    | ------> | yes: use EXIF     | ->|    /|\    |
+| /         |         | no: local Ollama  |   |    / \    |
++-----------+         | compare 4 views   |   +-----------+
+                      +-------------------+
+                      unclear -> keep original
+
+JPEG caption --------> EXIF ImageDescription + XPComment
+```
+
+Photo processing runs on your machine. The vision model is served by [Ollama](https://ollama.com)
+on `localhost`; images are not sent to a cloud service. The tool comes from the Daisy photo workflow.
 
 ## Install
 
+Requires Python 3.10+. Use a virtual environment, including with Homebrew Python on macOS:
+
 ```bash
-pip install .            # Python 3.10+, installs Pillow and piexif
-ollama pull ministral-3  # any Ollama vision model works; only needed for photos without camera orientation
+cd /path/to/photo-tidy
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+ollama pull ministral-3:8b
 ```
 
-## Usage
+Start the Ollama app or run `ollama serve`. Activate the environment with
+`source .venv/bin/activate` in each new terminal. Ollama is needed only when a photo
+has no usable camera rotation tag.
+
+## Use
 
 ```bash
-photo-tidy orient ~/Pictures/album --dry-run   # show what would change, write nothing
-photo-tidy orient ~/Pictures/album             # do it
+photo-tidy orient ~/Pictures/album --dry-run --verbose  # inspect decisions
+photo-tidy orient ~/Pictures/album                    # apply them
+photo-tidy orient photo.jpg --rotate 90 --dry-run      # preview a manual right turn
+photo-tidy orient photo.jpg --rotate 90                # apply that turn
 
 photo-tidy caption photo.jpg --set "Summer day at the lake"
-photo-tidy caption ~/Pictures/album --map captions.json   # {"IMG_0001.jpg": "Caption", ...} or a CSV
+photo-tidy caption ~/Pictures/album --map captions.json
 photo-tidy caption ~/Pictures/album --show
 ```
 
-`orient` options: `--model`, `--ollama-url`, `--no-bake-exif`, `--backup {model,all,none}`.
+`orient` accepts one photo or a folder, searched recursively. It handles JPEG and PNG.
+`--rotate` applies a clockwise angle of `0`, `90`, `180`, or `270` after EXIF correction
+and skips Ollama. On a folder, it rotates **every** photo by that angle.
 
-## How orientation is decided
+`--verbose` shows EXIF, the model's verdict for each rotation, and any final comparison.
+`unchanged` means no rotation was selected; it does not prove that the photo is upright.
 
-1. **Camera EXIF first.** If a photo has an EXIF orientation, it is trusted (no model call). The rotation is baked into
-   the pixels and the tag is reset, so the photo is upright in viewers that ignore EXIF too.
-   Use `--no-bake-exif` to leave such photos untouched, since most viewers already show them correctly.
-2. **Otherwise a vision model judges the photo in four rotations**, one at a time ("is this upright?").
-   The photo is rotated only if the original is judged wrong **and exactly one** rotation is judged right.
-   Contradictory or uncertain answers mean no change.
-3. Everything else is preserved: other EXIF tags stay, JPEGs are re-saved with the original quantization tables and
-   subsampling (no extra quality loss), and the caption survives the rotation.
-4. By default the original is copied to `_originals/` only when the *model* chose the rotation, because that is the
-   only change that could be wrong. Camera-EXIF baking is deterministic and needs no backup (`--backup all` to keep one).
+| Option | Effect |
+| --- | --- |
+| `--model NAME` | Choose an installed vision model; default `ministral-3` (8B) |
+| `--backup model` | Back up model-chosen and explicit rotations; default |
+| `--backup all` | Back up every changed photo, including EXIF corrections |
+| `--backup none` | Do not make backups |
+| `--no-bake-exif` | Leave photos with camera rotation tags untouched |
+| `--ollama-url URL` | Ollama server; default `http://localhost:11434` |
 
-Why so careful? In real use a single "rotate" verdict on a correct photo is much worse than missing a sideways one,
-and small vision models are not reliable enough to act on a single answer.
+## How it decides
 
-## Captions
+1. A camera EXIF rotation tag takes priority. Photo-tidy applies it to the pixels
+   and resets the tag. The model is not called.
+2. Otherwise, local Ollama checks the photo in four rotations. If the answers
+   conflict, it compares all four views together. An uncertain answer leaves the file alone.
+3. Before a model-chosen or explicit rotation, the original goes into `_originals/`.
+   Use `--backup all` to save originals for EXIF corrections too.
 
-EXIF `ImageDescription` is written as **UTF-8** (Pillow would silently turn non-ASCII characters into `?`), plus the
-Windows `XPComment` field. The image data is not re-encoded. Cameras sometimes embed a preview larger than 64 kB,
-which `piexif` refuses to rewrite; in that case only the embedded preview is dropped and all other tags are kept.
+The default vision model is `ministral-3`. You can try another image-capable model
+with `--model`, for example `qwen3.5:4b` after `ollama pull qwen3.5:4b`.
+Text-only `qwen3:8b` cannot inspect photos. Model accuracy varies; inspect
+`--dry-run --verbose` on photos you care about.
 
-## Limits
+## Captions and limits
 
-- Captions are written to JPEG only. PNG and others are rotated but not captioned.
-- A vision model can still be wrong about unusual scenes (macro, abstract, overhead shots). Run `--dry-run` first on
-  an archive you care about, and keep backups.
+Captions are written to JPEG EXIF `ImageDescription` as UTF-8 and to `XPComment`.
+A map is either a JSON object such as `{"IMG_0001.jpg": "Kesäpäivä"}` or a two-column
+CSV without a header (filename, caption). Caption changes do not re-encode pixels
+or create backups.
+
+Rotating a JPEG re-encodes it using the original compression settings, so it is
+not lossless. Camera EXIF is trusted even if it is wrong. HEIC and RAW are not
+supported. Other non-EXIF metadata may not survive rotation. A later change to
+a file can overwrite an existing `_originals/` backup with the same name.
 
 ## Development
 
 ```bash
-pip install -e .
-python -m unittest discover -s tests     # no Ollama needed: the model is stubbed
+python -m unittest discover -s tests
 ```
 
 MIT licensed.

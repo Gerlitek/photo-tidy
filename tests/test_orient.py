@@ -1,7 +1,10 @@
 import sys
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -9,7 +12,7 @@ import piexif
 from PIL import Image
 
 from photo_tidy.exif import read_caption, write_caption
-from photo_tidy.orient import BACKUP_DIR, choose_rotation, decide, fix_file, fix_folder, rotate
+from photo_tidy.orient import BACKUP_DIR, OllamaVision, choose_rotation, decide, fix_file, fix_folder, rotate
 
 
 def make(directory, tag=1, name="a.jpg"):
@@ -34,6 +37,28 @@ def says(*answers):
 NEVER = lambda img: (_ for _ in ()).throw(AssertionError("the model must not be asked"))
 
 
+class VisionResponse(unittest.TestCase):
+    def ask(self, answer):
+        body = json.dumps({"message": {"content": json.dumps(answer)}}).encode()
+        with mock.patch("photo_tidy.orient.urllib.request.urlopen", return_value=io.BytesIO(body)):
+            return OllamaVision().is_upright(Image.new("RGB", (10, 20)))
+
+    def test_boolean_model_answers_are_preserved(self):
+        for answer in (True, False):
+            self.assertIs(self.ask({"upright": answer}), answer)
+
+    def test_bad_model_answers_are_not_treated_as_upright(self):
+        for answer in ({"upright": "true"}, {"upright": "false"}, {"upright": 1}, {}):
+            with self.subTest(answer=answer), self.assertRaises(ValueError):
+                self.ask(answer)
+
+    def test_panel_response_maps_to_clockwise_rotation(self):
+        for label, degrees in (("A", 0), ("B", 90), ("C", 180), ("D", 270), ("unknown", None)):
+            body = json.dumps({"message": {"content": json.dumps({"panel": label})}}).encode()
+            with mock.patch("photo_tidy.orient.urllib.request.urlopen", return_value=io.BytesIO(body)):
+                self.assertEqual(OllamaVision().pick_panel(Image.new("RGB", (16, 8))), degrees)
+
+
 class Decision(unittest.TestCase):
     def test_conservative(self):
         self.assertEqual(decide({0: True, 90: False, 180: False, 270: False}), 0)
@@ -54,6 +79,45 @@ class Decision(unittest.TestCase):
 
 
 class FixFile(unittest.TestCase):
+    def test_panel_comparison_breaks_tie_in_dry_run(self):
+        p = make(tempfile.mkdtemp())
+        before = p.read_bytes()
+        result = fix_file(p, says(True, True, True, False), dry_run=True, pick_panel=lambda img: 90)
+        self.assertEqual((result.changed, result.degrees, result.panel_decision), (True, 90, 90))
+        self.assertEqual(p.read_bytes(), before)
+
+    def test_panel_comparison_can_keep_original(self):
+        p = make(tempfile.mkdtemp())
+        result = fix_file(p, says(True, True, True, False), pick_panel=lambda img: 0)
+        self.assertEqual((result.changed, result.panel_decision), (False, 0))
+
+    def test_explicit_rotation_skips_model_and_backs_up_original(self):
+        p = make(tempfile.mkdtemp())
+        write_caption(p, "Kesäpäivä")
+        before = p.read_bytes()
+        result = fix_file(p, NEVER, rotation=90)
+        self.assertEqual((result.changed, result.degrees, result.reason), (True, 90, "manual"))
+        with Image.open(p) as im:
+            self.assertEqual(im.size, (20, 40))
+            self.assertGreater(im.convert("RGB").getpixel((17, 2))[0], 200)
+            self.assertEqual(im.getexif()[0x0112], 1)
+        self.assertEqual(read_caption(p), "Kesäpäivä")
+        self.assertEqual((p.parent / BACKUP_DIR / p.name).read_bytes(), before)
+
+    def test_explicit_rotation_dry_run_leaves_original_untouched(self):
+        p = make(tempfile.mkdtemp())
+        before = p.read_bytes()
+        self.assertTrue(fix_file(p, NEVER, rotation=90, dry_run=True).changed)
+        self.assertEqual(p.read_bytes(), before)
+        self.assertFalse((p.parent / BACKUP_DIR).exists())
+
+    def test_explicit_rotation_is_applied_after_camera_exif(self):
+        p = make(tempfile.mkdtemp(), tag=6)
+        fix_file(p, NEVER, rotation=90)
+        with Image.open(p) as im:
+            self.assertEqual(im.size, (40, 20))
+            self.assertGreater(im.convert("RGB").getpixel((37, 17))[0], 200)
+
     def test_upright_photo_is_byte_identical(self):
         p = make(tempfile.mkdtemp())
         before = p.read_bytes()

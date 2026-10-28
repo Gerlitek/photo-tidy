@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from PIL import Image, ImageOps, JpegImagePlugin
+from PIL import Image, ImageDraw, ImageOps, JpegImagePlugin
 
 from photo_tidy.exif import read_caption, write_caption
 
@@ -31,6 +31,13 @@ PROMPT = ("Is this photo shown upright, the way a person would normally view it?
           "have their heads at the top and their feet or the floor at the bottom, the sky is at the top, and any text "
           "reads left to right. Answer true only if the photo is clearly upright, false if it is sideways or "
           "upside down.")
+PANEL_SCHEMA = {"type": "object", "properties": {"panel": {"type": "string", "enum": ["A", "B", "C", "D", "unknown"]}},
+                "required": ["panel"]}
+PANEL_PROMPT = ("The four labeled panels A, B, C and D show the SAME photo in four rotations. "
+                "Which single panel shows the photo in its natural upright orientation? "
+                "Look for vertical cues such as people, building, floor, sky and text. "
+                'Return JSON {"panel":"A"}, B, C, or D. Use "unknown" if orientation is not clear.')
+PANEL_DEGREES = {"A": 0, "B": 90, "C": 180, "D": 270}
 
 
 @dataclass
@@ -39,7 +46,9 @@ class Result:
     exif_tag: int
     degrees: int
     changed: bool
-    reason: str | None        # "model" | "exif" | None
+    reason: str | None        # "model" | "manual" | "exif" | None
+    upright: dict[int, bool] | None = None
+    panel_decision: int | None = None
 
 
 def rotate(img: Image.Image, degrees_cw: int) -> Image.Image:
@@ -77,15 +86,58 @@ class OllamaVision:
         }).encode()
         req = urllib.request.Request(self.url + "/api/chat", body, {"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return bool(json.loads(json.loads(r.read())["message"]["content"])["upright"])
+            payload = json.load(r)
+        try:
+            upright = json.loads(payload["message"]["content"])["upright"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Ollama did not return a valid upright boolean") from exc
+        if type(upright) is not bool:
+            raise ValueError("Ollama returned a non-boolean upright value")
+        return upright
+
+    def pick_panel(self, img: Image.Image) -> int | None:
+        """Compare four rotations together when independent yes/no answers disagree."""
+        base = img.convert("RGB")
+        sheet = Image.new("RGB", (1024, 816), "white")
+        draw = ImageDraw.Draw(sheet)
+        for i, degrees in enumerate(ROTATIONS):
+            tile = rotate(base, degrees).copy()
+            tile.thumbnail((496, 368))
+            x = (i % 2) * 512 + (512 - tile.width) // 2
+            y = (i // 2) * 408 + 32 + (376 - tile.height) // 2
+            sheet.paste(tile, (x, y))
+            draw.text(((i % 2) * 512 + 20, (i // 2) * 408 + 12), "ABCD"[i], fill="black", stroke_width=1)
+        buf = io.BytesIO()
+        sheet.save(buf, "JPEG", quality=90)
+        body = json.dumps({
+            "model": self.model, "stream": False, "think": False, "format": PANEL_SCHEMA,
+            "messages": [{"role": "user", "content": PANEL_PROMPT,
+                          "images": [base64.b64encode(buf.getvalue()).decode()]}],
+            "options": {"temperature": 0},
+        }).encode()
+        req = urllib.request.Request(self.url + "/api/chat", body, {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as response:
+            payload = json.load(response)
+        try:
+            panel = json.loads(payload["message"]["content"])["panel"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Ollama did not return a valid panel") from exc
+        if panel == "unknown":
+            return None
+        if panel not in PANEL_DEGREES:
+            raise ValueError("Ollama returned an invalid panel")
+        return PANEL_DEGREES[panel]
 
 
 def fix_file(path: Path, is_upright: Callable[[Image.Image], bool], *, dry_run: bool = False,
-             bake_exif: bool = True, backup: str = "model") -> Result:
+             bake_exif: bool = True, backup: str = "model", rotation: int | None = None,
+             pick_panel: Callable[[Image.Image], int | None] | None = None) -> Result:
     """Fix one photo. backup: "model" (copy the original only for model-chosen rotations), "all" or "none".
 
     The caption (EXIF ImageDescription) survives rotation. The original is copied to ``_originals/`` next to the file.
     """
+    if rotation is not None and rotation not in ROTATIONS:
+        raise ValueError("rotation must be 0, 90, 180 or 270 degrees clockwise")
     path = Path(path)
     caption = read_caption(path)
     with Image.open(path) as src:
@@ -95,10 +147,17 @@ def fix_file(path: Path, is_upright: Callable[[Image.Image], bool], *, dry_run: 
         subsampling = JpegImagePlugin.get_sampling(src) if fmt == "JPEG" else None
         base = ImageOps.exif_transpose(src)          # what a photo viewer would show
         base.load()
-        deg = 0 if tag != 1 else choose_rotation(base, is_upright)     # camera EXIF is trusted, no model call
+        upright = {d: is_upright(rotate(base, d)) for d in ROTATIONS} if tag == 1 and rotation is None else None
+        deg = rotation if rotation is not None else decide(upright) if upright is not None else 0
+        panel_decision = None
+        if upright is not None and deg == 0 and sum(upright.values()) != 1 and pick_panel is not None:
+            panel_decision = pick_panel(base)
+            if panel_decision is not None:
+                deg = panel_decision
         if deg == 0 and (tag == 1 or not bake_exif):
-            return Result(path.name, tag, 0, False, None)
-        result = Result(path.name, tag, deg, True, "model" if deg else "exif")
+            return Result(path.name, tag, 0, False, None, upright, panel_decision)
+        reason = ("manual" if rotation is not None else "model") if deg else "exif"
+        result = Result(path.name, tag, deg, True, reason, upright, panel_decision)
         if dry_run:
             return result
         final = rotate(base, deg)
@@ -106,7 +165,7 @@ def fix_file(path: Path, is_upright: Callable[[Image.Image], bool], *, dry_run: 
         kwargs: dict = {}
         if fmt in ("JPEG", "PNG"):
             kwargs["exif"] = exif.tobytes()
-        if fmt == "JPEG":                            # same compression as the original: no quality loss
+        if fmt == "JPEG":                            # reuse compression settings; pixels are re-encoded
             kwargs.update(qtables=qtables, subsampling=subsampling)
         if backup == "all" or (backup == "model" and deg != 0):
             folder = path.parent / BACKUP_DIR
